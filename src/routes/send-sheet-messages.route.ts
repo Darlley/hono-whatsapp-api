@@ -1,40 +1,18 @@
 import type { HonoAppType } from '@/lib/hono.js'
-import { client, isReady } from '@/lib/whatsappClient.js'
+import { isReady, client } from '@/lib/whatsappClient.js'
 import { z } from '@hono/zod-openapi'
 import csvParser from 'csv-parser'
 import { Readable } from 'stream'
 
-export type SheetType = { 
-  number: string; 
-  message: string 
-}
-
-// Função para formatar e validar o número de telefone
-function formatPhoneNumber(number: string): string {
-  // Remove caracteres não numéricos
-  let formatted = number.replace(/\D/g, '');
-  
-  // Verifica se o número já possui o código do país
-  if (!formatted.startsWith('55')) {
-    formatted = '55' + formatted;
-  }
-  
-  return formatted;
-}
-
 // Função para enviar mensagem para um número
-async function sendWhatsAppMessage(number: string, message: string): Promise<boolean> {
+async function sendTextMessage(number: string, message: string): Promise<boolean> {
   try {
-    // Formata o número e adiciona o sufixo @c.us
-    const formattedNumber = `${formatPhoneNumber(number)}@c.us`;
-    console.log(`Enviando mensagem para: ${formattedNumber}`);
-    
-    // Envia a mensagem
-    await client.sendMessage(formattedNumber, message);
-    return true;
+    await client.sendMessage(`${number}@c.us`, message)
+    console.log(`✅ Mensagem enviada com sucesso para ${number}: "${message.substring(0, 30)}${message.length > 30 ? '...' : ''}"`)
+    return true
   } catch (error) {
-    console.error(`Erro ao enviar mensagem para ${number}:`, error);
-    return false;
+    console.error(`❌ Erro ao enviar mensagem para ${number}:`, error)
+    return false
   }
 }
 
@@ -62,17 +40,23 @@ export function sendSheetMessages(app: HonoAppType): void {
             'application/json': {
               schema: z.object({
                 status: z.literal('success'),
-                data: z.array(
-                  z.object({
-                    number: z.string(),
-                    message: z.string(),
-                    sent: z.boolean(),
-                  })
-                ),
+                data: z.object({
+                  numbers: z.array(z.string()),
+                  messages: z.array(z.string()),
+                  totalSent: z.number(),
+                  totalFailed: z.number(),
+                  results: z.array(
+                    z.object({
+                      number: z.string(),
+                      messagesSent: z.number(),
+                      messagesFailed: z.number(),
+                    })
+                  )
+                }),
               }),
             },
           },
-          description: 'Planilha lida com sucesso e mensagens enviadas',
+          description: 'Mensagens enviadas com sucesso',
         },
         400: {
           content: {
@@ -139,7 +123,9 @@ export function sendSheetMessages(app: HonoAppType): void {
           }, 401);
         }
 
-        const results: Array<SheetType & { sent: boolean }> = [];
+        // Arrays separados para números e mensagens
+        const numbers: string[] = [];
+        const messages: string[] = [];
 
         return new Promise((resolve, reject) => {
           const stream = Readable.fromWeb(response.body as any);
@@ -150,40 +136,92 @@ export function sendSheetMessages(app: HonoAppType): void {
             .on('data', (data) => {
               console.log('Linha processada:', data);
 
-              // Filtramos apenas entradas válidas
-              if (data.number?.trim() && data.message?.trim()) {
-                results.push({...data, sent: false});
+              // Coleta números (se não estiver vazio)
+              if (data.number?.trim()) {
+                numbers.push(data.number.trim());
+              }
+              
+              // Coleta mensagens (se não estiver vazio)
+              if (data.message?.trim()) {
+                messages.push(data.message.trim());
               }
             })
             .on('end', async () => {
-              console.log('Processamento do CSV concluído, enviando mensagens...');
+              console.log(`Processamento do CSV concluído: ${numbers.length} números e ${messages.length} mensagens encontrados`);
               
-              // Declara a função fora do loop
-              async function sendTextMessage(number: string, message: string): Promise<boolean> {
-                try {
-                  await client.sendMessage(`${number}@c.us`, message)
-                  return true
-                } catch (error) {
-                  return false
-                }
+              if (numbers.length === 0) {
+                return resolve(c.json({ 
+                  status: 'error', 
+                  message: 'Nenhum número de telefone válido encontrado na planilha'
+                }, 400));
               }
-
-              // No loop
-              for (let i = 0; i < results.length; i++) {
-                const { number, message } = results[i];
-                console.log(`Enviando mensagem ${i+1}/${results.length}: ${number}`);
+              
+              if (messages.length === 0) {
+                return resolve(c.json({ 
+                  status: 'error', 
+                  message: 'Nenhuma mensagem válida encontrada na planilha'
+                }, 400));
+              }
+              
+              // Array para armazenar os resultados do envio
+              const results = [];
+              let totalSent = 0;
+              let totalFailed = 0;
+              
+              // Para cada número, envia todas as mensagens
+              for (let i = 0; i < numbers.length; i++) {
+                const number = numbers[i];
+                console.log(`📱 Enviando mensagens para o número ${i+1}/${numbers.length}: ${number}`);
                 
-                // Envia a mensagem e atualiza o status
-                results[i].sent = await sendTextMessage(number, message);
+                let messagesSent = 0;
+                let messagesFailed = 0;
                 
-                // Pequeno delay para evitar bloqueio do WhatsApp
-                if (i < results.length - 1) {
+                // Enviar cada mensagem para este número
+                for (let j = 0; j < messages.length; j++) {
+                  const message = messages[j];
+                  console.log(`  📝 Enviando mensagem ${j+1}/${messages.length}`);
+                  
+                  // Envia a mensagem e armazena o resultado
+                  const sent = await sendTextMessage(number, message);
+                  
+                  if (sent) {
+                    messagesSent++;
+                    totalSent++;
+                  } else {
+                    messagesFailed++;
+                    totalFailed++;
+                  }
+                  
+                  // Pequeno delay entre mensagens para o mesmo número
+                  if (j < messages.length - 1) {
+                    await new Promise(r => setTimeout(r, 500));
+                  }
+                }
+                
+                // Armazena os resultados para este número
+                results.push({
+                  number,
+                  messagesSent,
+                  messagesFailed
+                });
+                
+                // Delay maior entre números diferentes
+                if (i < numbers.length - 1) {
                   await new Promise(r => setTimeout(r, 1000));
                 }
               }
               
-              console.log('Envio de mensagens concluído');
-              resolve(c.json({ status: 'success', data: results }, 200));
+              console.log(`Envio de mensagens concluído: ${totalSent} enviadas, ${totalFailed} falhas`);
+              resolve(c.json({ 
+                status: 'success', 
+                data: {
+                  numbers,
+                  messages,
+                  totalSent,
+                  totalFailed,
+                  results
+                }
+              }, 200));
             })
             .on('error', (error) => {
               console.error('Erro ao processar CSV:', error);
